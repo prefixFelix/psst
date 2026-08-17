@@ -9,8 +9,7 @@ use crate::data::{Album, Cached, Image, Promise};
 pub struct ArtistDetail {
     pub artist: Promise<Artist, ArtistLink>,
     pub albums: Promise<ArtistAlbums, ArtistLink>,
-    pub related_artists: Promise<Cached<Vector<Artist>>, ArtistLink>,
-    pub artist_info: Promise<ArtistInfo, ArtistLink>,
+    pub overview: Promise<Cached<ArtistOverview>, ArtistLink>,
 }
 
 #[derive(Clone, Data, Lens, Deserialize)]
@@ -40,6 +39,15 @@ pub struct ArtistAlbums {
     pub compilations: Vector<Arc<Album>>,
     pub appears_on: Vector<Arc<Album>>,
 }
+
+/// Everything the artist page reads out of a single `queryArtistOverview`
+/// response: the info panel and the related artists shown below the albums.
+#[derive(Clone, Data, Lens)]
+pub struct ArtistOverview {
+    pub info: ArtistInfo,
+    pub related: Vector<Artist>,
+}
+
 #[derive(Clone, Data, Lens)]
 pub struct ArtistInfo {
     pub main_image: Arc<str>,

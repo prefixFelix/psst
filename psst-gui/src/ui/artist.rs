@@ -1,5 +1,4 @@
 use druid::{
-    im::Vector,
     kurbo::Circle,
     widget::{CrossAxisAlignment, Either, Flex, Label, LabelText, LineBreaking, List, Scroll},
     Data, Insets, LensExt, LocalizedString, Menu, MenuItem, Selector, Size, UnitPoint, Widget,
@@ -9,8 +8,8 @@ use druid::{
 use crate::{
     cmd,
     data::{
-        AppState, Artist, ArtistAlbums, ArtistDetail, ArtistInfo, ArtistLink, Cached, Ctx, Nav,
-        WithCtx,
+        AppState, Artist, ArtistAlbums, ArtistDetail, ArtistInfo, ArtistLink, ArtistOverview,
+        Cached, Ctx, Nav, WithCtx,
     },
     ui::utils::{stat_row, InfoLayout},
     webapi::WebApi,
@@ -48,32 +47,33 @@ fn async_albums_widget() -> impl Widget<AppState> {
         )
 }
 
+/// Owns the single artist overview request for the whole page.
 fn async_artist_info() -> impl Widget<AppState> {
-    Async::new(utils::spinner_widget, artist_info_widget, || Empty)
-        .lens(
-            Ctx::make(
-                AppState::common_ctx,
-                AppState::artist_detail.then(ArtistDetail::artist_info),
-            )
-            .then(Ctx::in_promise()),
+    Async::new(
+        utils::spinner_widget,
+        || artist_info_widget().lens(Ctx::map(Cached::data.then(ArtistOverview::info))),
+        || Empty,
+    )
+    .lens(
+        Ctx::make(
+            AppState::common_ctx,
+            AppState::artist_detail.then(ArtistDetail::overview),
         )
-        .on_command_async(
-            LOAD_DETAIL,
-            |d| WebApi::global().get_artist_info(&d.id),
-            |_, data, d| data.artist_detail.artist_info.defer(d),
-            |_, data, r| data.artist_detail.artist_info.update(r),
-        )
+        .then(Ctx::in_promise()),
+    )
+    .on_command_async(
+        LOAD_DETAIL,
+        |d| WebApi::global().get_artist_overview(&d.id),
+        |_, data, d| data.artist_detail.overview.defer(d),
+        |_, data, r| data.artist_detail.overview.update(r),
+    )
 }
 
+/// Renders part of the promise loaded by `async_artist_info`; intentionally
+/// has no `LOAD_DETAIL` handler of its own.
 fn async_related_widget() -> impl Widget<AppState> {
     Async::new(utils::spinner_widget, related_widget, utils::error_widget)
-        .lens(AppState::artist_detail.then(ArtistDetail::related_artists))
-        .on_command_async(
-            LOAD_DETAIL,
-            |d| WebApi::global().get_related_artists(&d.id),
-            |_, data, d| data.artist_detail.related_artists.defer(d),
-            |_, data, r| data.artist_detail.related_artists.update(r),
-        )
+        .lens(AppState::artist_detail.then(ArtistDetail::overview))
 }
 
 pub fn artist_widget(horizontal: bool) -> impl Widget<Artist> {
@@ -205,12 +205,12 @@ fn albums_widget() -> impl Widget<WithCtx<ArtistAlbums>> {
         )
 }
 
-fn related_widget() -> impl Widget<Cached<Vector<Artist>>> {
+fn related_widget() -> impl Widget<Cached<ArtistOverview>> {
     Flex::column()
         .cross_axis_alignment(CrossAxisAlignment::Start)
         .with_child(header_widget("Related Artists"))
         .with_child(List::new(|| artist_widget(false)))
-        .lens(Cached::data)
+        .lens(Cached::data.then(ArtistOverview::related))
 }
 
 fn header_widget<T: Data>(text: impl Into<LabelText<T>>) -> impl Widget<T> {

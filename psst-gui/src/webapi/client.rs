@@ -38,10 +38,10 @@ use ureq::{
 use crate::{
     data::{
         self, utils::sanitize_html_string, Album, AlbumType, Artist, ArtistAlbums, ArtistInfo,
-        ArtistLink, ArtistStats, AudioAnalysis, Cached, DatePrecision, Episode, EpisodeId,
-        EpisodeLink, Image, MixedView, Nav, Page, Playlist, PublicUser, Range, Recommendations,
-        RecommendationsRequest, SearchResults, SearchTopic, Show, SpotifyUrl, Track, TrackLines,
-        UserProfile,
+        ArtistLink, ArtistOverview, ArtistStats, AudioAnalysis, Cached, DatePrecision, Episode,
+        EpisodeId, EpisodeLink, Image, MixedView, Nav, Page, Playlist, PublicUser, Range,
+        Recommendations, RecommendationsRequest, SearchResults, SearchTopic, Show, SpotifyUrl,
+        Track, TrackLines, UserProfile,
     },
     error::Error,
     ui::credits::TrackCredits,
@@ -1088,83 +1088,91 @@ impl WebApi {
         Ok(releases)
     }
 
-    // https://developer.spotify.com/documentation/web-api/reference/get-an-artists-related-artists
-    pub fn get_related_artists(&self, id: &str) -> Result<Cached<Vector<Artist>>, Error> {
+    // Artist bio, stats, image, external links and related artists, from the
+    // pathfinder GraphQL `queryArtistOverview` operation.  One response feeds
+    // the whole artist page, so it is fetched, cached and parsed as one.
+    pub fn get_artist_overview(&self, id: &str) -> Result<Cached<ArtistOverview>, Error> {
         #[derive(Clone, Data, Deserialize)]
-        struct Artists {
-            artists: Vector<Artist>,
+        struct Welcome {
+            data: WelcomeData,
         }
-        let request = &RequestBuilder::new(
-            format!("v1/artists/{id}/related-artists"),
-            Method::Get,
-            None,
-        );
-        let result: Cached<Artists> = self.load_cached(request, "related-artists", id)?;
-        Ok(result.map(|result| result.artists))
-    }
-
-    pub fn get_artist_info(&self, id: &str) -> Result<ArtistInfo, Error> {
-        #[derive(Clone, Data, Deserialize)]
-        pub struct Welcome {
-            data: Data1,
-        }
-
         #[derive(Clone, Data, Deserialize)]
         #[serde(rename_all = "camelCase")]
-        pub struct Data1 {
+        struct WelcomeData {
             artist_union: ArtistUnion,
         }
-
-        #[derive(Clone, Data, Deserialize)]
-        pub struct ArtistUnion {
-            profile: Profile,
-            stats: Stats,
-            visuals: Visuals,
-        }
-
+        // Sparse artists (no monthly listeners yet) omit `profile`, `stats`,
+        // `visuals` and `relatedContent` entirely, so every branch must
+        // tolerate their absence.
         #[derive(Clone, Data, Deserialize)]
         #[serde(rename_all = "camelCase")]
-        pub struct Profile {
-            biography: Biography,
+        struct ArtistUnion {
+            profile: Option<Profile>,
+            stats: Option<Stats>,
+            visuals: Option<Visuals>,
+            related_content: Option<RelatedContent>,
+        }
+        #[derive(Clone, Data, Default, Deserialize)]
+        #[serde(rename_all = "camelCase")]
+        struct Profile {
+            biography: Option<Biography>,
+            #[serde(default)]
             external_links: ExternalLinks,
         }
-
         #[derive(Clone, Data, Deserialize)]
-        pub struct Biography {
-            text: String,
+        struct Biography {
+            text: Option<String>,
         }
-
-        #[derive(Clone, Data, Deserialize)]
-        pub struct ExternalLinks {
+        #[derive(Clone, Data, Default, Deserialize)]
+        struct ExternalLinks {
+            #[serde(default)]
             items: Vector<ExternalLinksItem>,
         }
-
         #[derive(Clone, Data, Deserialize)]
+        struct ExternalLinksItem {
+            url: String,
+        }
+        // Individual counters can also be null even when `stats` is present.
+        #[derive(Clone, Data, Default, Deserialize)]
         #[serde(rename_all = "camelCase")]
-        pub struct Visuals {
-            avatar_image: AvatarImage,
+        struct Stats {
+            followers: Option<i64>,
+            monthly_listeners: Option<i64>,
+            world_rank: Option<i64>,
         }
         #[derive(Clone, Data, Deserialize)]
-        pub struct AvatarImage {
+        #[serde(rename_all = "camelCase")]
+        struct Visuals {
+            avatar_image: Option<AvatarImage>,
+        }
+        #[derive(Clone, Data, Deserialize)]
+        struct AvatarImage {
+            #[serde(default)]
             sources: Vector<Image>,
         }
         #[derive(Clone, Data, Deserialize)]
-        pub struct ExternalLinksItem {
-            url: String,
-        }
-
-        #[derive(Clone, Data, Deserialize)]
         #[serde(rename_all = "camelCase")]
-        pub struct Stats {
-            followers: i64,
-            monthly_listeners: i64,
-            world_rank: i64,
+        struct RelatedContent {
+            #[serde(default)]
+            related_artists: RelatedArtists,
+        }
+        #[derive(Clone, Data, Default, Deserialize)]
+        struct RelatedArtists {
+            #[serde(default)]
+            items: Vector<RelatedArtist>,
+        }
+        // Related artists carry the same `visuals` shape as the artist itself.
+        #[derive(Clone, Data, Deserialize)]
+        struct RelatedArtist {
+            id: Arc<str>,
+            profile: RelatedProfile,
+            visuals: Option<Visuals>,
+        }
+        #[derive(Clone, Data, Deserialize)]
+        struct RelatedProfile {
+            name: Arc<str>,
         }
 
-        let variables = json!( {
-            "locale": "",
-            "uri": format!("spotify:artist:{}", id),
-        });
         let json = json!({
             "extensions": {
                 "persistedQuery": {
@@ -1173,48 +1181,80 @@ impl WebApi {
                 }
             },
             "operationName": "queryArtistOverview",
-            "variables": variables,
+            "variables": {
+                "locale": "",
+                "uri": format!("spotify:artist:{id}"),
+            },
         });
-
         let request =
             &RequestBuilder::new("pathfinder/v2/query".to_string(), Method::Post, Some(json))
                 .set_base_uri("api-partner.spotify.com")
-                .header("User-Agent", Self::user_agent());
-        let result: Cached<Welcome> = self.load_cached(request, "artist-info", id)?;
+                .header("User-Agent", Self::user_agent())
+                // `api-partner` rejects the Web API OAuth token with a 403; it
+                // needs the first-party Login5 bearer + client-token.
+                .partner_auth();
+        // The cache has no versioning, so the bucket name is effectively the
+        // schema version: changing the shape parsed here needs a new one.
+        let result: Cached<Welcome> = self.load_cached(request, "artist-overview", id)?;
+        Ok(result.map(|welcome| {
+            let union = welcome.data.artist_union;
 
-        let hrefs: Vector<String> = result
-            .data
-            .data
-            .artist_union
-            .profile
-            .external_links
-            .items
-            .into_iter()
-            .map(|link| link.url)
-            .collect();
+            let main_image = union
+                .visuals
+                .and_then(|visuals| visuals.avatar_image)
+                .and_then(|image| image.sources.into_iter().next())
+                .map(|source| source.url)
+                .unwrap_or_else(|| Arc::from(""));
 
-        Ok(ArtistInfo {
-            main_image: Arc::from(
-                result.data.data.artist_union.visuals.avatar_image.sources[0]
-                    .url
-                    .to_string(),
-            ),
-            stats: ArtistStats {
-                followers: result.data.data.artist_union.stats.followers,
-                monthly_listeners: result.data.data.artist_union.stats.monthly_listeners,
-                world_rank: result.data.data.artist_union.stats.world_rank,
-            },
-            bio: {
-                let sanitized_bio = sanitize_str(
-                    &DEFAULT,
-                    &result.data.data.artist_union.profile.biography.text,
-                )
+            let profile = union.profile.unwrap_or_default();
+            let stats = union.stats.unwrap_or_default();
+
+            let bio = profile
+                .biography
+                .and_then(|biography| biography.text)
+                .map(|text| {
+                    let sanitized = sanitize_str(&DEFAULT, &text).unwrap_or_default();
+                    sanitized.replace("&amp;", "&")
+                })
                 .unwrap_or_default();
-                sanitized_bio.replace("&amp;", "&")
-            },
 
-            artist_links: hrefs,
-        })
+            let artist_links = profile
+                .external_links
+                .items
+                .into_iter()
+                .map(|link| link.url)
+                .collect();
+
+            let related = union
+                .related_content
+                .map(|content| content.related_artists.items)
+                .unwrap_or_default()
+                .into_iter()
+                .map(|artist| Artist {
+                    id: artist.id,
+                    name: artist.profile.name,
+                    images: artist
+                        .visuals
+                        .and_then(|visuals| visuals.avatar_image)
+                        .map(|image| image.sources)
+                        .unwrap_or_default(),
+                })
+                .collect();
+
+            ArtistOverview {
+                info: ArtistInfo {
+                    main_image,
+                    stats: ArtistStats {
+                        followers: stats.followers.unwrap_or(0),
+                        monthly_listeners: stats.monthly_listeners.unwrap_or(0),
+                        world_rank: stats.world_rank.unwrap_or(0),
+                    },
+                    bio,
+                    artist_links,
+                },
+                related,
+            }
+        }))
     }
 }
 
