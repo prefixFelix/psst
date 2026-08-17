@@ -1,5 +1,5 @@
 use std::{
-    collections::HashMap,
+    collections::{HashMap, HashSet},
     fmt::Display,
     io::{self, Read},
     path::PathBuf,
@@ -55,6 +55,10 @@ pub struct WebApi {
     cache: WebApiCache,
     local_track_manager: Mutex<LocalTrackManager>,
     paginated_limit: usize,
+    // Playlists the Web API answered with a 404.  The detail page loads
+    // metadata and tracks separately, and both would otherwise pay for the same
+    // 404 on every visit before reaching `api-partner`.
+    partner_playlists: Mutex<HashSet<Arc<str>>>,
     webapi_token: Mutex<Option<WebApiToken>>,
     webapi_client_id: Mutex<Option<String>>,
     // First-party session credentials, used for `api-partner.spotify.com`
@@ -81,6 +85,7 @@ impl WebApi {
             cache: WebApiCache::new(cache_base),
             local_track_manager: Mutex::new(LocalTrackManager::new()),
             paginated_limit,
+            partner_playlists: Mutex::new(HashSet::new()),
             webapi_token: Mutex::new(None),
             webapi_client_id: Mutex::new(None),
             session: Mutex::new(None),
@@ -1802,7 +1807,7 @@ impl WebApi {
     }
 
     /// Fetch one page of a playlist through `api-partner`.  Spotify's own
-    /// generated playlists (Daily Mix, Discover Weekly, Release Radar, …) are
+    /// generated playlists (Daily Mix, Discover Weekly, Release Radar, ...) are
     /// no longer exposed to third-party clients on the Web API and 404 there,
     /// but pathfinder still serves them.
     fn fetch_playlist(
@@ -1830,6 +1835,16 @@ impl WebApi {
 
         let response: FetchPlaylistResponse = self.load(request)?;
         Ok(response.data.playlist_v2)
+    }
+
+    /// Whether a previous request already found this playlist missing from the
+    /// Web API, so it can be requested from `api-partner` directly.
+    fn is_partner_playlist(&self, id: &str) -> bool {
+        self.partner_playlists.lock().contains(id)
+    }
+
+    fn mark_partner_playlist(&self, id: &str) {
+        self.partner_playlists.lock().insert(Arc::from(id));
     }
 
     fn get_partner_playlist_tracks(&self, id: &str) -> Result<Vector<Arc<Track>>, Error> {
@@ -1860,11 +1875,17 @@ impl WebApi {
 
     // https://developer.spotify.com/documentation/web-api/reference/get-playlist
     pub fn get_playlist(&self, id: &str) -> Result<Playlist, Error> {
+        // Only the metadata is wanted here, so ask for the smallest page of
+        // tracks pathfinder will give us.
+        if self.is_partner_playlist(id) {
+            return Ok(self.fetch_playlist(id, 0, 1)?.to_playlist());
+        }
         let request = &RequestBuilder::new(format!("v1/playlists/{id}"), Method::Get, None);
         match self.load(request) {
-            // Only the metadata is wanted here, so ask for the smallest page of
-            // tracks pathfinder will give us.
-            Err(Error::WebApiStatus(404)) => Ok(self.fetch_playlist(id, 0, 1)?.to_playlist()),
+            Err(Error::WebApiStatus(404)) => {
+                self.mark_partner_playlist(id);
+                Ok(self.fetch_playlist(id, 0, 1)?.to_playlist())
+            }
             result => result,
         }
     }
@@ -1889,12 +1910,19 @@ impl WebApi {
             Json(serde_json::Value),
         }
 
+        if self.is_partner_playlist(id) {
+            return self.get_partner_playlist_tracks(id);
+        }
+
         let request = &RequestBuilder::new(format!("v1/playlists/{id}/items"), Method::Get, None)
             .query("marker", "from_token")
             .query("additional_types", "track");
 
         let result: Vector<PlaylistItem> = match self.load_all_pages(request) {
-            Err(Error::WebApiStatus(404)) => return self.get_partner_playlist_tracks(id),
+            Err(Error::WebApiStatus(404)) => {
+                self.mark_partner_playlist(id);
+                return self.get_partner_playlist_tracks(id);
+            }
             result => result?,
         };
 
