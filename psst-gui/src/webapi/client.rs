@@ -1591,11 +1591,9 @@ struct PartnerPlaylist {
     uri: String,
     #[serde(default)]
     name: Arc<str>,
-    #[serde(default)]
     description: Option<String>,
     #[serde(default)]
     images: PartnerImages,
-    #[serde(default)]
     owner_v2: Option<PartnerOwner>,
     #[serde(default)]
     collaborative: bool,
@@ -1640,7 +1638,6 @@ struct PartnerContent {
 #[derive(Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct PartnerContentItem {
-    #[serde(default)]
     item_v2: Option<PartnerItem>,
 }
 
@@ -1664,7 +1661,6 @@ struct PartnerTrack {
     name: Arc<str>,
     #[serde(default)]
     track_duration: PartnerDuration,
-    #[serde(default)]
     album_of_track: Option<PartnerAlbum>,
     // Same `{ uri, profile { name } }` shape the discography responses use.
     #[serde(default)]
@@ -1673,9 +1669,7 @@ struct PartnerTrack {
     disc_number: usize,
     #[serde(default)]
     track_number: usize,
-    #[serde(default)]
     playability: Option<PartnerPlayability>,
-    #[serde(default)]
     content_rating: Option<PartnerContentRating>,
 }
 
@@ -1882,10 +1876,18 @@ impl WebApi {
         }
         let request = &RequestBuilder::new(format!("v1/playlists/{id}"), Method::Get, None);
         match self.load(request) {
-            Err(Error::WebApiStatus(404)) => {
-                self.mark_partner_playlist(id);
-                Ok(self.fetch_playlist(id, 0, 1)?.to_playlist())
-            }
+            Err(Error::WebApiStatus(404)) => match self.fetch_playlist(id, 0, 1) {
+                Ok(playlist) => {
+                    self.mark_partner_playlist(id);
+                    Ok(playlist.to_playlist())
+                }
+                // Neither source has it, so the playlist is genuinely gone.
+                // Report that instead of how the second attempt failed.
+                Err(err) => {
+                    log::warn!("playlist {id} missing from api-partner as well: {err}");
+                    Err(Error::WebApiStatus(404))
+                }
+            },
             result => result,
         }
     }
@@ -1920,8 +1922,18 @@ impl WebApi {
 
         let result: Vector<PlaylistItem> = match self.load_all_pages(request) {
             Err(Error::WebApiStatus(404)) => {
-                self.mark_partner_playlist(id);
-                return self.get_partner_playlist_tracks(id);
+                return match self.get_partner_playlist_tracks(id) {
+                    Ok(tracks) => {
+                        self.mark_partner_playlist(id);
+                        Ok(tracks)
+                    }
+                    // Neither source has it, so the playlist is genuinely gone.
+                    // Report that instead of how the second attempt failed.
+                    Err(err) => {
+                        log::warn!("playlist {id} missing from api-partner as well: {err}");
+                        Err(Error::WebApiStatus(404))
+                    }
+                };
             }
             result => result?,
         };
